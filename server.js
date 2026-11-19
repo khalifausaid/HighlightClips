@@ -93,18 +93,28 @@ async function fetchYoutubeCaptions(url, dir) {
 async function callCaptionAI(config,prompt){
   const headers={'Content-Type':'application/json'};let endpoint,body;
   if(config.provider==='openai'){endpoint='https://api.openai.com/v1/chat/completions';headers.Authorization=`Bearer ${config.apiKey}`;body={model:config.model,messages:[{role:'user',content:prompt}],temperature:0.1};}
+  else if(config.provider==='groq'){endpoint='https://api.groq.com/openai/v1/chat/completions';headers.Authorization=`Bearer ${config.apiKey}`;body={model:config.model,messages:[{role:'user',content:prompt}],temperature:0.1};}
   else if(config.provider==='anthropic'){endpoint='https://api.anthropic.com/v1/messages';headers['x-api-key']=config.apiKey;headers['anthropic-version']='2023-06-01';body={model:config.model,max_tokens:2048,messages:[{role:'user',content:prompt}]};}
   else if(config.provider==='gemini'){endpoint='https://generativelanguage.googleapis.com/v1beta/interactions';headers['x-goog-api-key']=config.apiKey;body={model:config.model,input:prompt,store:false};}
   else throw new Error('Choose a supported AI provider.');
   const response=await fetch(endpoint,{method:'POST',headers,body:JSON.stringify(body),signal:AbortSignal.timeout(90000)});const data=await response.json().catch(()=>({}));
   if(!response.ok)throw new Error(data.error?.message||data.message||`AI provider returned ${response.status}.`);
-  if(config.provider==='openai')return data.choices?.[0]?.message?.content||'';
+  if(config.provider==='openai'||config.provider==='groq')return data.choices?.[0]?.message?.content||'';
   if(config.provider==='anthropic')return data.content?.filter(x=>x.type==='text').map(x=>x.text).join('\n')||'';
   return (data.steps||[]).filter(x=>x.type==='model_output').flatMap(x=>x.content||[]).filter(x=>x.type==='text').map(x=>x.text).join('\n');
 }
+async function transcribeClipGroq(project,clip,wavPath,mode,vttPath){
+  const data=new FormData();data.append('file',new Blob([fs.readFileSync(wavPath)]),`highlight-${clip.id}.wav`);data.append('model','whisper-large-v3');data.append('response_format','verbose_json');data.append('timestamp_granularities[]','segment');if(mode==='english')data.append('language','en');
+  project.transcriptionProgress={stage:'transcribing',percent:0,remainingSeconds:20,model:'Groq Whisper Large'};updateProject(project);
+  const response=await fetch('https://api.groq.com/openai/v1/audio/transcriptions',{method:'POST',headers:{Authorization:`Bearer ${aiConnection.apiKey}`},body:data,signal:AbortSignal.timeout(120000)}),result=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(result.error?.message||`Groq transcription failed (${response.status}).`);
+  const segments=(result.segments||[]).filter(s=>s.text&&s.end>s.start);if(!segments.length)throw new Error('No speech was detected in the highlighted clip.');
+  project.detectedCaptionLanguage=String(result.language||'unknown').toLowerCase();project.transcriptionProgress={stage:'transcribing',percent:100,remainingSeconds:0,detectedLanguage:project.detectedCaptionLanguage};
+  fs.writeFileSync(vttPath,'WEBVTT\n\n'+segments.map(s=>`${vttTime(s.start)} --> ${vttTime(s.end)}\n${String(s.text).trim()}`).join('\n\n')+'\n','utf8');
+}
 async function translateCaptions(cues,language){
   if(!aiConnection||!cues.length)return cues;
-  const languageName=language?new Intl.DisplayNames(['en'],{type:'language'}).of(language)||language:'the detected language';
+  let languageName=language||'the detected language';try{languageName=new Intl.DisplayNames(['en'],{type:'language'}).of(language)||languageName}catch{}
   const prompt=`Translate these video subtitle lines from ${languageName} into natural, concise English. Preserve meaning and tone. Return only a JSON array of strings with exactly ${cues.length} items in the original order. Do not add explanations.\n${JSON.stringify(cues.map(c=>c.text))}`;
   const response=await callCaptionAI(aiConnection,prompt);const parsed=JSON.parse(response.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,''));
   if(!Array.isArray(parsed)||parsed.length!==cues.length||parsed.some(x=>typeof x!=='string'))throw new Error('The connected AI returned captions in an unexpected format.');
@@ -116,7 +126,8 @@ async function generateCaptions(project,clip,settings={}) {
   try {
     const duration=clip.end-clip.start;project.transcriptionProgress={stage:'extracting',percent:0,remainingSeconds:Math.max(2,Math.round(duration*.25))};updateProject(project);
     await execFileAsync(mediaTool('ffmpeg'),['-y','-v','error','-ss',String(clip.start),'-i',project.videoPath,'-t',String(duration),'-vn','-ac','1','-ar','16000','-c:a','pcm_s16le',wavPath],{timeout:10*60*1000,maxBuffer:2*1024*1024});
-    await new Promise((resolve,reject)=>{
+    if(aiConnection?.provider==='groq')await transcribeClipGroq(project,clip,wavPath,mode,vttPath);
+    else await new Promise((resolve,reject)=>{
       const proc=spawn(PYTHON,[path.join(ROOT,'transcribe.py'),wavPath,vttPath,helperMode,'auto',whisperModel],{stdio:['ignore','pipe','pipe']});let stdoutBuffer='',stderr='';let lastSave=0;
       const timeout=setTimeout(()=>proc.kill(),20*60*1000);
       proc.stdout.on('data',chunk=>{
@@ -269,12 +280,12 @@ async function exportClip(project,clip,settings={}) {
     let vf=layout==='fill'?`scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`:`scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black`;
     if(subtitleFilter)vf+=`,${subtitleFilter}`;renderArgs=['-vf',vf];
   }
-  const estimate=Math.max(8,Math.round(duration*(Number(settings.resolution||1080)/720)**2*(quality==='high'?2.4:quality==='small'?.65:1.25)));
+  const estimate=Math.min(480,Math.max(8,Math.round(duration*(Number(settings.resolution||1080)/720)**1.4*(quality==='high'?.9:quality==='small'?.3:.45))));
   project.exportProgress={stage:'rendering',percent:0,remainingSeconds:estimate};updateProject(project);
   try{
     await new Promise((resolve,reject)=>{
       const proc=spawn(mediaTool('ffmpeg'),[...inputArgs,...renderArgs,'-c:v','libx264','-preset',preset,'-crf',String(crf),'-c:a','aac','-b:a','192k','-movflags','+faststart','-progress','pipe:1','-nostats',dest],{stdio:['ignore','pipe','pipe']});let buffer='',stderr='',lastSave=0;const start=Date.now(),timeout=setTimeout(()=>proc.kill(),30*60*1000);
-      proc.stdout.on('data',chunk=>{buffer+=chunk.toString();const lines=buffer.split(/\r?\n/);buffer=lines.pop()||'';for(const line of lines){const [key,value]=line.split('=');if(key==='out_time_us'){const done=Math.min(duration,Number(value)/1e6),fraction=Math.min(.99,done/duration),elapsed=(Date.now()-start)/1000;project.exportProgress={stage:'rendering',percent:Math.round(fraction*100),remainingSeconds:fraction>.02?Math.round(elapsed*(1-fraction)/fraction):estimate};if(Date.now()-lastSave>900){updateProject(project);lastSave=Date.now();}}}});
+      proc.stdout.on('data',chunk=>{buffer+=chunk.toString();const lines=buffer.split(/\r?\n/);buffer=lines.pop()||'';for(const line of lines){const [key,value]=line.split('=');if(key==='out_time_us'){const done=Math.min(duration,Number(value)/1e6),fraction=Math.min(.99,done/duration),elapsed=(Date.now()-start)/1000,measured=fraction>.05?Math.round(elapsed*(1-fraction)/fraction):estimate;project.exportProgress={stage:'rendering',percent:Math.round(fraction*100),remainingSeconds:Math.min(estimate,Math.max(1,measured))};if(Date.now()-lastSave>900){updateProject(project);lastSave=Date.now();}}}});
       proc.stderr.on('data',chunk=>{if(stderr.length<12000)stderr+=chunk.toString();});proc.on('error',e=>{clearTimeout(timeout);reject(new Error(`FFmpeg could not start: ${e.message}`));});proc.on('close',code=>{clearTimeout(timeout);code===0?resolve():reject(new Error(stderr.split(/\r?\n/).filter(Boolean).slice(-3).join(' ')||'FFmpeg export failed.'));});
     });
     clip.exported=true;clip.file=name;clip.captionFile=srtPath?path.basename(srtPath):null;updateProject(project);return dest;
@@ -287,7 +298,7 @@ const server=http.createServer(async(req,res)=>{
     if(req.method==='GET'&&url.pathname==='/api/health')return send(res,200,{ok:true,mode:'local'});
     if(req.method==='GET'&&url.pathname==='/api/ai/status')return send(res,200,{connected:!!aiConnection,provider:aiConnection?.provider||null,model:aiConnection?.model||null});
     if(req.method==='POST'&&url.pathname==='/api/ai/connect'){
-      const body=await readJson(req);const provider=['openai','gemini','anthropic'].includes(body.provider)?body.provider:null,apiKey=String(body.apiKey||'').trim(),model=String(body.model||'').trim();
+      const body=await readJson(req);const provider=['openai','gemini','anthropic','groq'].includes(body.provider)?body.provider:null,apiKey=String(body.apiKey||'').trim(),model=String(body.model||'').trim();
       if(!provider||!apiKey||!model)return send(res,400,{error:'Choose a provider and enter its API key and model.'});
       const candidate={provider,apiKey,model};const result=await callCaptionAI(candidate,'Reply with the single word OK.');if(!result.trim())return send(res,422,{error:'The provider connected but returned an empty reply.'});aiConnection=candidate;return send(res,200,{connected:true,provider,model});
     }
