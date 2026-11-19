@@ -16,6 +16,7 @@ const PORT = Number(process.env.PORT || 3000);
 const LOCAL_YT_DLP = path.join(DATA, 'tools', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
 const YT_DLP = process.env.YT_DLP || (fs.existsSync(LOCAL_YT_DLP) ? LOCAL_YT_DLP : 'yt-dlp');
 const PYTHON = process.env.PYTHON || 'python';
+let aiConnection = null;
 const MIME = { '.html':'text/html; charset=utf-8', '.css':'text/css; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.json':'application/json; charset=utf-8', '.mp4':'video/mp4', '.srt':'text/plain; charset=utf-8' };
 fs.mkdirSync(DATA, { recursive: true });
 
@@ -64,8 +65,7 @@ async function fetchYoutubeVideo(inputUrl, projectId) {
     const stat = fs.statSync(videoPath);
     if (stat.size > MAX_VIDEO) throw new Error('Video exceeds the 2 GB processing limit.');
     const info = await probe(videoPath);
-    const captionPath = await fetchYoutubeCaptions(url, dir);
-    return { videoPath, duration: info.duration, videoName: title, captionPath };
+    return { videoPath, duration: info.duration, videoName: title, captionPath:null };
   } catch (error) {
     fs.rmSync(dir, { recursive: true, force: true });
     const detail = String(error.stderr || error.message || '');
@@ -90,22 +90,45 @@ async function fetchYoutubeCaptions(url, dir) {
   } catch { return null; }
 }
 
-async function generateCaptions(project) {
-  const dir=path.dirname(project.videoPath),wavPath=path.join(dir,'speech-audio.wav'),vttPath=path.join(dir,'captions-generated.vtt');
+async function callCaptionAI(config,prompt){
+  const headers={'Content-Type':'application/json'};let endpoint,body;
+  if(config.provider==='openai'){endpoint='https://api.openai.com/v1/chat/completions';headers.Authorization=`Bearer ${config.apiKey}`;body={model:config.model,messages:[{role:'user',content:prompt}],temperature:0.1};}
+  else if(config.provider==='anthropic'){endpoint='https://api.anthropic.com/v1/messages';headers['x-api-key']=config.apiKey;headers['anthropic-version']='2023-06-01';body={model:config.model,max_tokens:2048,messages:[{role:'user',content:prompt}]};}
+  else if(config.provider==='gemini'){endpoint='https://generativelanguage.googleapis.com/v1beta/interactions';headers['x-goog-api-key']=config.apiKey;body={model:config.model,input:prompt,store:false};}
+  else throw new Error('Choose a supported AI provider.');
+  const response=await fetch(endpoint,{method:'POST',headers,body:JSON.stringify(body),signal:AbortSignal.timeout(90000)});const data=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(data.error?.message||data.message||`AI provider returned ${response.status}.`);
+  if(config.provider==='openai')return data.choices?.[0]?.message?.content||'';
+  if(config.provider==='anthropic')return data.content?.filter(x=>x.type==='text').map(x=>x.text).join('\n')||'';
+  return (data.steps||[]).filter(x=>x.type==='model_output').flatMap(x=>x.content||[]).filter(x=>x.type==='text').map(x=>x.text).join('\n');
+}
+async function translateCaptions(cues,language){
+  if(!aiConnection||!cues.length)return cues;
+  const languageName=language?new Intl.DisplayNames(['en'],{type:'language'}).of(language)||language:'the detected language';
+  const prompt=`Translate these video subtitle lines from ${languageName} into natural, concise English. Preserve meaning and tone. Return only a JSON array of strings with exactly ${cues.length} items in the original order. Do not add explanations.\n${JSON.stringify(cues.map(c=>c.text))}`;
+  const response=await callCaptionAI(aiConnection,prompt);const parsed=JSON.parse(response.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,''));
+  if(!Array.isArray(parsed)||parsed.length!==cues.length||parsed.some(x=>typeof x!=='string'))throw new Error('The connected AI returned captions in an unexpected format.');
+  return cues.map((cue,i)=>({...cue,text:parsed[i].trim()}));
+}
+async function generateCaptions(project,clip,settings={}) {
+  const dir=path.dirname(project.videoPath),wavPath=path.join(dir,`speech-${clip.id}.wav`),mode=['original','english'].includes(settings.captionLanguage)?settings.captionLanguage:'translated',whisperModel=['tiny','base','small'].includes(settings.captionModel)?settings.captionModel:'base',providerTag=mode==='translated'&&aiConnection?crypto.createHash('sha1').update(`${aiConnection.provider}:${aiConnection.model}`).digest('hex').slice(0,8):'local',helperMode=mode==='translated'&&aiConnection?'original':mode,vttPath=path.join(dir,`captions-${clip.id}-${mode}-${whisperModel}-${providerTag}.vtt`);
+  if(fs.existsSync(vttPath)&&parseVtt(fs.readFileSync(vttPath,'utf8')).length)return vttPath;
   try {
-    project.transcriptionProgress={stage:'extracting',percent:0,remainingSeconds:null};updateProject(project);
-    await execFileAsync(mediaTool('ffmpeg'),['-y','-v','error','-i',project.videoPath,'-vn','-ac','1','-ar','16000','-c:a','pcm_s16le',wavPath],{timeout:60*60*1000,maxBuffer:2*1024*1024});
+    const duration=clip.end-clip.start;project.transcriptionProgress={stage:'extracting',percent:0,remainingSeconds:Math.max(2,Math.round(duration*.25))};updateProject(project);
+    await execFileAsync(mediaTool('ffmpeg'),['-y','-v','error','-ss',String(clip.start),'-i',project.videoPath,'-t',String(duration),'-vn','-ac','1','-ar','16000','-c:a','pcm_s16le',wavPath],{timeout:10*60*1000,maxBuffer:2*1024*1024});
     await new Promise((resolve,reject)=>{
-      const proc=spawn(PYTHON,[path.join(ROOT,'transcribe.py'),wavPath,vttPath],{stdio:['ignore','pipe','pipe']});let stdoutBuffer='',stderr='';let lastSave=0;
-      const timeout=setTimeout(()=>proc.kill(),4*60*60*1000);
+      const proc=spawn(PYTHON,[path.join(ROOT,'transcribe.py'),wavPath,vttPath,helperMode,'auto',whisperModel],{stdio:['ignore','pipe','pipe']});let stdoutBuffer='',stderr='';let lastSave=0;
+      const timeout=setTimeout(()=>proc.kill(),20*60*1000);
       proc.stdout.on('data',chunk=>{
         stdoutBuffer+=chunk.toString();const lines=stdoutBuffer.split(/\r?\n/);stdoutBuffer=lines.pop()||'';
-        for(const line of lines){try{const progress=JSON.parse(line);if(progress.stage){project.transcriptionProgress=progress;const now=Date.now();if(now-lastSave>1500){updateProject(project);lastSave=now;}}}catch{}}
+        for(const line of lines){try{const progress=JSON.parse(line);if(progress.stage){project.transcriptionProgress=progress;if(progress.detectedLanguage)project.detectedCaptionLanguage=progress.detectedLanguage;const now=Date.now();if(now-lastSave>1000){updateProject(project);lastSave=now;}}}catch{}}
       });
       proc.stderr.on('data',chunk=>{if(stderr.length<12000)stderr+=chunk.toString();});
       proc.on('error',error=>{clearTimeout(timeout);reject(new Error(`Python could not start: ${error.message}`));});
       proc.on('close',code=>{clearTimeout(timeout);if(code===0)resolve();else reject(new Error(stderr.split(/\r?\n/).filter(Boolean).slice(-2).join(' ')||`Caption generation stopped (exit ${code}).`));});
     });
+    if(mode==='translated'&&aiConnection){project.transcriptionProgress={stage:'translating',percent:0,remainingSeconds:20};updateProject(project);const translated=await translateCaptions(parseVtt(fs.readFileSync(vttPath,'utf8')),project.detectedCaptionLanguage);fs.writeFileSync(vttPath,'WEBVTT\n\n'+translated.map(c=>`${vttTime(c.start)} --> ${vttTime(c.end)}\n${c.text}`).join('\n\n')+'\n','utf8');project.captionTranslation='ai';}
+    else project.captionTranslation=mode==='translated'?'whisper':'transcribe';
     if(fs.existsSync(vttPath)&&parseVtt(fs.readFileSync(vttPath,'utf8')).length){
       project.captionSource='generated';
       return vttPath;
@@ -163,6 +186,7 @@ function parseVttTime(value) {
   if(parts.some(n=>!Number.isFinite(n)))return 0;
   return parts.length===3?parts[0]*3600+parts[1]*60+parts[2]:parts[0]*60+parts[1];
 }
+function vttTime(seconds){const ms=Math.max(0,Math.round(seconds*1000)),h=Math.floor(ms/3600000),m=Math.floor(ms%3600000/60000),s=Math.floor(ms%60000/1000),r=ms%1000;return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${String(r).padStart(3,'0')}`;}
 function parseVtt(content) {
   const cues=[];const blocks=content.replace(/^\uFEFF/,'').split(/\r?\n\s*\r?\n/);
   for(const block of blocks){
@@ -181,44 +205,35 @@ function hookStrength(text) {
 }
 function srtTime(seconds) { const ms=Math.max(0,Math.round(seconds*1000));const h=Math.floor(ms/3600000),m=Math.floor(ms%3600000/60000),s=Math.floor(ms%60000/1000),rem=ms%1000;return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')},${String(rem).padStart(3,'0')}`; }
 function makeClipSrt(cues,clip,captionStyle='creator') {
-  const selected=cues.filter(c=>c.end>clip.start&&c.start<clip.end);return selected.map((c,i)=>{
-    const start=Math.max(0,c.start-clip.start),end=Math.min(clip.end-clip.start,c.end-clip.start);
-    const safe=c.text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    const color=captionStyle==='neon'?'#65E5FF':'#D6F379';const styled=captionStyle==='creator'||captionStyle==='neon'?safe.replace(/\b(actually|amazing|best|biggest|crazy|finally|first|greatest|how|important|insane|mistake|never|problem|secret|solution|truth|wait|what|why|win|worst|wow)\b/gi,`<font color="${color}"><b>$1</b></font>`):safe;
-    return `${i+1}\n${srtTime(start)} --> ${srtTime(end)}\n${styled}`;
-  }).join('\n\n')+'\n';
+  const selected=cues.filter(c=>c.end>clip.start&&c.start<clip.end),events=[];
+  for(const cue of selected){
+    const raw=cue.text.trim(),words=raw.split(/\s+/).filter(Boolean),groups=[];if(words.length===1&&Array.from(words[0]).length>30){const chars=Array.from(words[0]);for(let i=0;i<chars.length;i+=16)groups.push(chars.slice(i,i+16).join(''));}let line='';
+    if(!groups.length)for(const word of words){if(line&&(line.length+word.length+1>30||line.split(/\s+/).length>=5)){groups.push(line);line='';}line+=(line?' ':'')+word;}
+    if(line)groups.push(line);if(!groups.length)continue;
+    const start=Math.max(0,cue.start-clip.start),end=Math.min(clip.end-clip.start,cue.end-clip.start),part=(end-start)/groups.length;
+    groups.forEach((text,index)=>{
+      const safe=text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      const color=captionStyle==='neon'?'#65E5FF':'#D6F379';const styled=captionStyle==='creator'||captionStyle==='neon'?safe.replace(/\b(actually|amazing|best|biggest|crazy|finally|first|greatest|how|important|insane|mistake|never|problem|secret|solution|truth|wait|what|why|win|worst|wow)\b/gi,`<font color="${color}"><b>$1</b></font>`):safe;
+      events.push({start:start+part*index,end:index===groups.length-1?end:start+part*(index+1),text:styled});
+    });
+  }
+  return events.map((c,i)=>`${i+1}\n${srtTime(c.start)} --> ${srtTime(c.end)}\n${c.text}`).join('\n\n')+'\n';
 }
 async function analyze(project) {
-  project.status='analyzing'; project.updatedAt=new Date().toISOString(); updateProject(project);
+  project.status='analyzing';project.transcriptionProgress={stage:'scanning',percent:0,remainingSeconds:Math.max(8,Math.round((project.duration||60)*.08))};project.updatedAt=new Date().toISOString();updateProject(project);
   try {
     const info=await probe(project.videoPath); project.duration=info.duration; project.sourceWidth=info.width; project.sourceHeight=info.height;
     const pcm=await runFfmpeg(['-v','error','-i',project.videoPath,'-vn','-ac','1','-ar','8000','-f','f32le','pipe:1'],120*1024*1024);
     const samples=new Float32Array(pcm.buffer,pcm.byteOffset,Math.floor(pcm.length/4)); const rate=8000; const secCount=Math.ceil(samples.length/rate); const levels=[];
     for(let s=0;s<secCount;s++){let sum=0,n=Math.min(rate,samples.length-s*rate);for(let i=0;i<n;i++){const v=samples[s*rate+i];sum+=v*v;}levels.push(Math.sqrt(sum/Math.max(n,1)));}
-    project.captionGenerationError=null;
-    const generatedPath=await generateCaptions(project);
-    if(generatedPath)project.captionPath=generatedPath;
-    else if(!project.captionPath||!fs.existsSync(project.captionPath))project.captionSource='none';
-    const captions=project.captionPath&&fs.existsSync(project.captionPath)?parseVtt(fs.readFileSync(project.captionPath,'utf8')):[];
     const sorted=[...levels].sort((a,b)=>a-b);const baseline=sorted[Math.floor(sorted.length*.55)]||0.00001;const median=sorted[Math.floor(sorted.length*.5)]||0;const peakLevel=sorted.at(-1)||1;const meanLevel=levels.reduce((a,b)=>a+b,0)/Math.max(levels.length,1);const threshold=Math.max(median+(project.sensitivity==='High'?0.12:project.sensitivity==='Low'?0.34:0.22)*peakLevel,baseline*1.7,0.003);
     const clipLen=Math.min(35,Math.max(12,info.duration));const maxStart=Math.max(0,info.duration-clipLen);const candidates=[];
-    if(captions.length){
-      for(let start=0;start<=maxStart;start+=10){
-        const end=Math.min(info.duration,start+clipLen);const cues=captions.filter(c=>c.end>start&&c.start<end);if(!cues.length)continue;
-        const windowLevels=levels.slice(Math.floor(start),Math.max(Math.floor(start)+1,Math.ceil(end)));const localPeak=Math.max(...windowLevels,0);const localMean=windowLevels.reduce((a,b)=>a+b,0)/Math.max(windowLevels.length,1);
-        const audioScore=Math.min(1,0.62*(localPeak/Math.max(peakLevel,0.001))+0.38*(localMean/Math.max(meanLevel*2,0.001)));
-        const words=cues.map(c=>c.text.match(/[\p{L}\p{N}']+/gu)||[]).flat();const textHook=cues.reduce((sum,c)=>sum+hookStrength(c.text),0)/cues.length;const speechFlow=Math.min(1,words.length/70);const editorialScore=0.68*textHook+0.32*speechFlow;
-        const strongest=[...cues].sort((a,b)=>hookStrength(b.text)-hookStrength(a.text))[0];const score=Math.round(30+audioScore*28+editorialScore*42);
-        candidates.push({start,end,score,peak:start+windowLevels.indexOf(localPeak),hook:strongest?.text||'',reason:textHook>0.45?`Spoken hook · ${strongest.text.slice(0,72)}`:`Strong speech flow · ${words.length} words`,audioPeak:localPeak/Math.max(baseline,0.003)});
-      }
-    }
-    if(!candidates.length){
-      levels.forEach((value,s)=>{if(value<threshold)return;const start=Math.max(0,Math.min(maxStart,s-clipLen*.58));const end=Math.min(info.duration,start+clipLen);const energyScore=Math.max(0,value-baseline)/Math.max(baseline,0.003);candidates.push({start,end,score:Math.min(99,Math.round(45+energyScore*14)),peak:s,reason:`Audio peak ${energyScore.toFixed(1)}× above baseline`,audioPeak:energyScore});});
-    }
+    levels.forEach((value,s)=>{if(value<threshold)return;const start=Math.max(0,Math.min(maxStart,s-clipLen*.58));const end=Math.min(info.duration,start+clipLen);const energyScore=Math.max(0,value-baseline)/Math.max(baseline,0.003);const window=levels.slice(Math.floor(start),Math.ceil(end));const peak=Math.max(...window,0);const average=window.reduce((a,b)=>a+b,0)/Math.max(window.length,1);const engagement=Math.min(1,.62*peak/Math.max(peakLevel,.001)+.38*average/Math.max(meanLevel*2,.001));candidates.push({start,end,score:Math.min(99,Math.round(42+engagement*45+Math.min(12,energyScore*2))),peak:s,reason:`Strong audio moment · ${energyScore.toFixed(1)}× above baseline`,audioPeak:energyScore});});
     candidates.sort((a,b)=>b.score-a.score);const clips=[];
     for(const point of candidates){if(clips.length>=10)break;if(point.score<48)continue;const start=Math.max(0,Math.min(maxStart,point.start));const end=Math.min(info.duration,start+clipLen);if(clips.some(c=>start<c.end+1.5&&end>c.start-1.5))continue;clips.push({id:crypto.randomUUID(),start:Number(start.toFixed(2)),end:Number(end.toFixed(2)),score:Math.min(99,point.score),reason:point.reason,hook:point.hook||'',peak:Number(point.peak.toFixed(2)),exported:false});}
-    clips.sort((a,b)=>a.start-b.start);project.clips=clips;project.captionCount=captions.length;project.status='ready';project.analysisNote=clips.length?(captions.length?(project.captionSource==='generated'?'Generated captions from the video audio. Captions will be burned into exported clips.':'Using available YouTube captions. Captions will be burned into exported clips.'):`Ranked by audio energy. Captions could not be generated.${project.captionGenerationError?` ${project.captionGenerationError}`:''}`):'No clear moments found. Try High sensitivity or another video.';
+    clips.sort((a,b)=>a.start-b.start);project.clips=clips;project.captionCount=0;project.status='ready';project.analysisNote=clips.length?'Highlights found from the full video. Captions are created only for the selected clip when you export it.':'No clear moments found. Try High sensitivity or another video.';
   } catch(e){project.status='error';project.error=e.message;}
+  project.transcriptionProgress=null;
   project.updatedAt=new Date().toISOString();updateProject(project);return project;
 }
 
@@ -231,15 +246,18 @@ async function exportClip(project,clip,settings={}) {
   const layout=['fill','fit','blur'].includes(settings.layout)?settings.layout:'fill';const captionStyle=['creator','classic','boxed','minimal','neon'].includes(settings.captionStyle)?settings.captionStyle:'creator';
   const quality=settings.quality||'balanced',crf=quality==='high'?18:quality==='small'?28:23,preset=quality==='high'?'slow':quality==='small'?'veryfast':'medium';
   let subtitleFilter='';let srtPath=null;
-  if(settings.captions!==false&&project.captionPath&&fs.existsSync(project.captionPath)){
-    const cues=parseVtt(fs.readFileSync(project.captionPath,'utf8'));srtPath=path.join(dir,`clip-${clip.id}.srt`);fs.writeFileSync(srtPath,makeClipSrt(cues,clip,captionStyle),'utf8');
+  if(settings.captions!==false){
+    const vttPath=await generateCaptions(project,clip,settings);
+    if(!vttPath)throw new Error(project.captionGenerationError||'Captions could not be generated for this clip.');
+    const cues=parseVtt(fs.readFileSync(vttPath,'utf8'));srtPath=path.join(dir,`clip-${clip.id}.srt`);fs.writeFileSync(srtPath,makeClipSrt(cues,{start:0,end:duration},captionStyle),'utf8');clip.captionLanguage=settings.captionLanguage==='original'?(project.detectedCaptionLanguage||'original'):'English';
     const escaped=path.resolve(srtPath).replace(/\\/g,'/').replace(/^([A-Za-z]):/,'$1\\:').replace(/'/g,"\\'");
+    const sizeBase={creator:54,classic:46,boxed:46,minimal:40,neon:54}[captionStyle],fontSize=Math.round(sizeBase*height/1920),margin=Math.round(height*.12);
     const captionStyles={
-      creator:'FontName=Arial,FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00101010,BorderStyle=1,Outline=3,Shadow=2,Alignment=2,MarginV=190',
-      classic:'FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00101010,BorderStyle=1,Outline=3,Shadow=1,Alignment=2,MarginV=170',
-      boxed:'FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,BackColour=&HBB101010,BorderStyle=3,Outline=0,Shadow=0,Alignment=2,MarginV=180',
-      minimal:'FontName=Arial,FontSize=17,PrimaryColour=&H00FFFFFF,OutlineColour=&H50000000,BorderStyle=1,Outline=1,Shadow=0,Alignment=2,MarginV=140',
-      neon:'FontName=Arial,FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00B43CFF,BorderStyle=1,Outline=3,Shadow=2,Alignment=2,MarginV=190',
+      creator:`FontName=Arial,FontSize=${fontSize},Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00101010,BorderStyle=1,Outline=4,Shadow=2,Alignment=2,MarginV=${margin}`,
+      classic:`FontName=Arial,FontSize=${fontSize},PrimaryColour=&H00FFFFFF,OutlineColour=&H00101010,BorderStyle=1,Outline=3,Shadow=1,Alignment=2,MarginV=${margin}`,
+      boxed:`FontName=Arial,FontSize=${fontSize},Bold=1,PrimaryColour=&H00FFFFFF,BackColour=&HBB101010,BorderStyle=3,Outline=0,Shadow=0,Alignment=2,MarginV=${margin}`,
+      minimal:`FontName=Arial,FontSize=${fontSize},PrimaryColour=&H00FFFFFF,OutlineColour=&H50000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=${margin}`,
+      neon:`FontName=Arial,FontSize=${fontSize},Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00B43CFF,BorderStyle=1,Outline=4,Shadow=2,Alignment=2,MarginV=${margin}`,
     };
     subtitleFilter=`subtitles='${escaped}':force_style='${captionStyles[captionStyle]}'`;clip.captionFile=path.basename(srtPath);
   }
@@ -251,14 +269,28 @@ async function exportClip(project,clip,settings={}) {
     let vf=layout==='fill'?`scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`:`scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black`;
     if(subtitleFilter)vf+=`,${subtitleFilter}`;renderArgs=['-vf',vf];
   }
-  await execFileAsync(mediaTool('ffmpeg'),[...inputArgs,...renderArgs,'-c:v','libx264','-preset',preset,'-crf',String(crf),'-c:a','aac','-b:a','192k','-movflags','+faststart',dest],{timeout:30*60*1000,maxBuffer:2*1024*1024});
-  clip.exported=true;clip.file=name;updateProject(project);return dest;
+  const estimate=Math.max(8,Math.round(duration*(Number(settings.resolution||1080)/720)**2*(quality==='high'?2.4:quality==='small'?.65:1.25)));
+  project.exportProgress={stage:'rendering',percent:0,remainingSeconds:estimate};updateProject(project);
+  try{
+    await new Promise((resolve,reject)=>{
+      const proc=spawn(mediaTool('ffmpeg'),[...inputArgs,...renderArgs,'-c:v','libx264','-preset',preset,'-crf',String(crf),'-c:a','aac','-b:a','192k','-movflags','+faststart','-progress','pipe:1','-nostats',dest],{stdio:['ignore','pipe','pipe']});let buffer='',stderr='',lastSave=0;const start=Date.now(),timeout=setTimeout(()=>proc.kill(),30*60*1000);
+      proc.stdout.on('data',chunk=>{buffer+=chunk.toString();const lines=buffer.split(/\r?\n/);buffer=lines.pop()||'';for(const line of lines){const [key,value]=line.split('=');if(key==='out_time_us'){const done=Math.min(duration,Number(value)/1e6),fraction=Math.min(.99,done/duration),elapsed=(Date.now()-start)/1000;project.exportProgress={stage:'rendering',percent:Math.round(fraction*100),remainingSeconds:fraction>.02?Math.round(elapsed*(1-fraction)/fraction):estimate};if(Date.now()-lastSave>900){updateProject(project);lastSave=Date.now();}}}});
+      proc.stderr.on('data',chunk=>{if(stderr.length<12000)stderr+=chunk.toString();});proc.on('error',e=>{clearTimeout(timeout);reject(new Error(`FFmpeg could not start: ${e.message}`));});proc.on('close',code=>{clearTimeout(timeout);code===0?resolve():reject(new Error(stderr.split(/\r?\n/).filter(Boolean).slice(-3).join(' ')||'FFmpeg export failed.'));});
+    });
+    clip.exported=true;clip.file=name;clip.captionFile=srtPath?path.basename(srtPath):null;updateProject(project);return dest;
+  }finally{project.exportProgress=null;updateProject(project);}
 }
 
 const server=http.createServer(async(req,res)=>{
   const url=new URL(req.url,'http://localhost');
   try {
     if(req.method==='GET'&&url.pathname==='/api/health')return send(res,200,{ok:true,mode:'local'});
+    if(req.method==='GET'&&url.pathname==='/api/ai/status')return send(res,200,{connected:!!aiConnection,provider:aiConnection?.provider||null,model:aiConnection?.model||null});
+    if(req.method==='POST'&&url.pathname==='/api/ai/connect'){
+      const body=await readJson(req);const provider=['openai','gemini','anthropic'].includes(body.provider)?body.provider:null,apiKey=String(body.apiKey||'').trim(),model=String(body.model||'').trim();
+      if(!provider||!apiKey||!model)return send(res,400,{error:'Choose a provider and enter its API key and model.'});
+      const candidate={provider,apiKey,model};const result=await callCaptionAI(candidate,'Reply with the single word OK.');if(!result.trim())return send(res,422,{error:'The provider connected but returned an empty reply.'});aiConnection=candidate;return send(res,200,{connected:true,provider,model});
+    }
     if(req.method==='GET'&&url.pathname==='/api/projects')return send(res,200,readProjects().map(({videoPath,chatPath,captionPath,...p})=>p));
     const projectMatch=url.pathname.match(/^\/api\/projects\/([\w-]+)$/);
     if(req.method==='GET'&&projectMatch){const p=getProject(projectMatch[1]);if(!p)return send(res,404,{error:'Project not found.'});const{videoPath,chatPath,captionPath,...safe}=p;return send(res,200,safe);}
