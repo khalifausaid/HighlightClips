@@ -1,0 +1,8 @@
+{
+  "name": "highlightclips",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first highlight clip maker for user-provided video and chat files",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=20" }
+}
