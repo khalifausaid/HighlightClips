@@ -1,6 +1,6 @@
 # HighlightClips
 
-A local-first starter app for finding audio highlight moments in public YouTube videos. Paste a YouTube link; no account sign-in or video/chat ownership check is required. Downloaded videos and optional chat replay files are saved under `data/` on this computer.
+A local-first app for finding highlight moments in public YouTube videos. Paste a YouTube link; no account sign-in or video/chat ownership check is required. Downloaded videos and optional chat replay files are saved under `data/` on this computer.
 
 ## Run it in VS Code
 
@@ -21,16 +21,17 @@ No npm package installation is needed; the server uses Node's built-in modules. 
 
 - Paste a public YouTube video URL and fetch it locally (up to 2 GB).
 - Optionally attach a chat replay file (up to 100 MB); no ownership confirmation is required.
-- Find up to ten non-overlapping highlight moments using local audio analysis.
+- Find 3, 5, 8, or 10 non-overlapping highlight moments with local audio analysis. Set each clip to 15, 30, 45, or 60 seconds, then preview each candidate from its start before exporting.
+- Optionally include timestamped JSON, JSONL, CSV, or TXT chat replay data. Local chat bursts add weight to moments the audience reacted to; no chat text is uploaded to an AI provider.
 - Generate captions only for the selected clip during export. The multilingual faster-whisper model detects the spoken language and supports English translation, English transcription, or transcription in the original language. Choose fast, balanced, or more accurate speech recognition per export.
 - Connect Groq's free tier for faster, more accurate Whisper speech recognition and translation, or Google AI Studio's free tier for transcript translation; OpenAI and Anthropic APIs are also supported. Free-tier access needs a provider API key and has provider-set limits. With Groq, only the selected clip's audio is uploaded for Whisper transcription; with other providers, only transcript text is sent for translation. The key stays in server memory.
 - Fit caption line length, font size, placement, and emphasis to the selected aspect ratio and caption style.
 - Show estimated remaining time during video fetching, highlight analysis, caption generation, AI connection/translation, and clip rendering.
-- Choose 9:16, 4:5, 1:1, or 16:9; fill crop, black fit, or blurred fit layout; 720p through 4K resolution; and high, balanced, or smaller-file encoding quality.
+- Choose 9:16, 4:5, 1:1, or 16:9; fill crop, black fit, or blurred fit; export a selected gameplay crop or a picture-in-picture face-cam layout with four corner positions; save and reload the custom crop layout on this device; choose 720p through 4K and high, balanced, or smaller-file encoding quality.
 - Delete a project and its source/output files.
 - Persist project metadata and media locally in `data/`.
 
-The app accepts public YouTube video links from any user and does not verify ownership. Link fetching is limited to YouTube and youtu.be hosts; private, age-restricted, unavailable, or live videos may fail. This is a single-user local development app, not a hosted multi-user service. The local multilingual Whisper model must be installed with `pip install -r requirements.txt`; selected models download on first caption export. Without a cloud provider, video and audio remain local. If Groq is connected, the selected clip's audio is sent to its transcription API; translation providers receive only transcript text. Chat replay files are stored but their message contents are not yet included in scoring. Face tracking, animated word-by-word karaoke captions, editing/reordering clips, ZIP exports, sign-in, and retention scheduling are follow-on work.
+The app accepts public YouTube video links from any user and does not verify ownership. Link fetching is limited to YouTube and youtu.be hosts; private, age-restricted, unavailable, or live videos may fail. This is a single-user local development app, not a hosted multi-user service. The local multilingual Whisper model must be installed with `pip install -r requirements.txt`; selected models download on first caption export. Without a cloud provider, video and audio remain local. If Groq is connected, the selected clip's audio is sent to its transcription API; translation providers receive only transcript text. Chat formats vary; message scoring requires recognizable timestamps relative to the video. Face tracking, animated word-by-word karaoke captions, editing/reordering clips, bulk ZIP export, sign-in, and retention scheduling are follow-on work.
 
 ## Project layout
 
